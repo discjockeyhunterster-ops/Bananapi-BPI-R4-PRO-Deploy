@@ -1,11 +1,11 @@
 # Builds the BPI-R4 Pro 8X with ./build.sh bpi-r4-pro-8x <variant>.
-# The upstream revisions come from pins.conf; the dispatch inputs
-# openwrt_commit/mtk_commit override them for a trial build.
-# The images are always kept as a workflow artifact for 14 days; they replace
-# the public releases only when "publish" is ticked.
 name: Build BPI-R4 Pro 8X
 
 on:
+  schedule:
+    # 每周一北京时间早上 04:00 自动运行（UTC 时间每周日 20:00）
+    # 如需每天运行，可改为 '0 20 * * *'
+    - cron: '0 20 * * 0'
   workflow_dispatch:
     inputs:
       variant:
@@ -16,22 +16,27 @@ on:
         options:
           - Pro-8X-wifi
           - Pro-8X-wired
+      use_latest_upstream:
+        description: 'Auto-fetch latest OpenWrt & MTK commits (override pins.conf)'
+        required: false
+        default: true
+        type: boolean
       repo_commit:
         description: 'Commit hash of this repository (leave empty for latest)'
         required: false
         default: ''
       openwrt_commit:
-        description: 'OpenWrt commit hash (leave empty to use pins.conf)'
+        description: 'Manual OpenWrt commit hash (overrides auto-fetch)'
         required: false
         default: ''
       mtk_commit:
-        description: 'MTK SDK commit hash (leave empty to use pins.conf)'
+        description: 'Manual MTK SDK commit hash (overrides auto-fetch)'
         required: false
         default: ''
       publish:
         description: 'Publish to the release tags (unchecked: images only as a workflow artifact)'
         required: false
-        default: false
+        default: true
         type: boolean
 
 permissions:
@@ -52,16 +57,39 @@ jobs:
 
       - name: Load build versions
         run: |
+          # 1. 先加载默认 pins.conf 作为兜底
           grep -v '^\s*#' pins.conf | grep -v '^\s*$' >> $GITHUB_ENV
+
+          # 2. 如果是定时自动运行，或者手动勾选了 use_latest_upstream，则自动获取上游最新 Commit
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event.inputs.use_latest_upstream }}" = "true" ]; then
+            echo "Fetching latest upstream commits..."
+            LATEST_OPENWRT=$(git ls-remote https://openwrt.org refs/heads/openwrt-25.12 | cut -f1)
+            LATEST_MTK=$(git ls-remote https://mediatek.com refs/heads/master | cut -f1)
+            LATEST_MT76=$(git ls-remote https://github.com HEAD | cut -f1)
+            LATEST_MAC80211=$(git ls-remote https://github.com HEAD | cut -f1)
+            LATEST_HOSTAPD=$(git ls-remote https://github.com HEAD | cut -f1)
+            LATEST_IW=$(git ls-remote https://github.com HEAD | cut -f1)
+            LATEST_WIFI_SCRIPTS=$(git ls-remote https://github.com HEAD | cut -f1)
+
+            [ -n "$LATEST_OPENWRT" ] && echo "OPENWRT_COMMIT=$LATEST_OPENWRT" >> $GITHUB_ENV
+            [ -n "$LATEST_MTK" ] && echo "MTK_COMMIT=$LATEST_MTK" >> $GITHUB_ENV
+            [ -n "$LATEST_MT76" ] && echo "SOFTMAC_MT76=$LATEST_MT76" >> $GITHUB_ENV
+            [ -n "$LATEST_MAC80211" ] && echo "SOFTMAC_MAC80211=$LATEST_MAC80211" >> $GITHUB_ENV
+            [ -n "$LATEST_HOSTAPD" ] && echo "SOFTMAC_HOSTAPD=$LATEST_HOSTAPD" >> $GITHUB_ENV
+            [ -n "$LATEST_IW" ] && echo "SOFTMAC_IW=$LATEST_IW" >> $GITHUB_ENV
+            [ -n "$LATEST_WIFI_SCRIPTS" ] && echo "SOFTMAC_WIFI_SCRIPTS=$LATEST_WIFI_SCRIPTS" >> $GITHUB_ENV
+          fi
+
+          # 3. 如果手动填写了指定 Commit，则以手动填写的为准
           [ -n "${{ github.event.inputs.openwrt_commit }}" ] && echo "OPENWRT_COMMIT=${{ github.event.inputs.openwrt_commit }}" >> $GITHUB_ENV || true
           [ -n "${{ github.event.inputs.mtk_commit }}" ] && echo "MTK_COMMIT=${{ github.event.inputs.mtk_commit }}" >> $GITHUB_ENV || true
 
       - name: Set build variables
         run: |
-          VARIANT="${{ github.event.inputs.variant }}"
+          # 定时任务触发时 inputs.variant 为空，默认使用 Pro-8X-wifi
+          VARIANT="${{ github.event.inputs.variant || 'Pro-8X-wifi' }}"
+          echo "EFFECTIVE_VARIANT=$VARIANT" >> $GITHUB_ENV
 
-          # Not BUILD_VARIANT: the OpenWrt make reads that from the environment
-          # and builds every package (U-Boot too) as that variant.
           if [ "$VARIANT" = "Pro-8X-wifi" ]; then
             echo "BOARD_VARIANT=standard" >> $GITHUB_ENV
             echo "RELEASE_TAGS=release-pro-8x-standard" >> $GITHUB_ENV
@@ -72,8 +100,6 @@ jobs:
 
       - name: Runner hardware
         run: |
-          # Build times differ by up to 2x between runs of the same tree;
-          # record what each runner was so slow runs can be told apart.
           nproc; lscpu | grep -E 'Model name|^CPU\(s\)'; free -g | head -2
 
       - name: Free disk space on runner
@@ -100,7 +126,6 @@ jobs:
 
       - name: Prepare release artifacts
         run: |
-          VARIANT="${{ github.event.inputs.variant }}"
           FILOGIC="openwrt/bin/targets/mediatek/filogic"
 
           mkdir -p rel-pro
@@ -125,7 +150,7 @@ jobs:
       - name: Upload images as a workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: images-bpi-r4-pro-8x-${{ github.event.inputs.variant }}
+          name: images-bpi-r4-pro-8x-${{ env.EFFECTIVE_VARIANT }}
           path: |
             rel-pro/*.itb
             rel-pro/openwrt-*-sdcard.img.gz
@@ -134,7 +159,7 @@ jobs:
           retention-days: 14
 
       - name: Publish release-pro-8x-standard
-        if: github.event.inputs.publish == 'true' && (github.event.inputs.variant == 'Pro-8X-wifi')
+        if: (github.event_name == 'schedule' || github.event.inputs.publish == 'true') && (env.EFFECTIVE_VARIANT == 'Pro-8X-wifi')
         run: |
           gh release delete release-pro-8x-standard --yes --cleanup-tag 2>/dev/null || true
           gh release create release-pro-8x-standard rel-pro/* \
@@ -144,7 +169,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Publish release-pro-8x-wired
-        if: github.event.inputs.publish == 'true' && (github.event.inputs.variant == 'Pro-8X-wired')
+        if: (github.event_name == 'schedule' || github.event.inputs.publish == 'true') && (env.EFFECTIVE_VARIANT == 'Pro-8X-wired')
         run: |
           gh release delete release-pro-8x-wired --yes --cleanup-tag 2>/dev/null || true
           gh release create release-pro-8x-wired rel-pro/* \
